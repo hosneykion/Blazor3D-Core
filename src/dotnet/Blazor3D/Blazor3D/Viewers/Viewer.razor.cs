@@ -1,4 +1,5 @@
-﻿using Microsoft.JSInterop;
+﻿using System.Threading;
+using Microsoft.JSInterop;
 using Microsoft.AspNetCore.Components;
 using HomagGroup.Blazor3D.Settings;
 using HomagGroup.Blazor3D.Scenes;
@@ -19,9 +20,13 @@ namespace HomagGroup.Blazor3D.Viewers
     /// <summary>
     /// <para>HomagGroup.Blazor3D viewer component.</para>
     /// </summary>
-    public sealed partial class Viewer : IDisposable
+    public sealed partial class Viewer : IDisposable, IAsyncDisposable
     {
-        private IJSObjectReference bundleModule = null!;
+        private IJSObjectReference? bundleModule;
+        private readonly SemaphoreSlim lifecycleGate = new(1, 1);
+        private int disposeStarted;
+        private bool eventsSubscribed;
+        private bool IsDisposing => Volatile.Read(ref disposeStarted) != 0;
 
         private delegate void SelectedObjectStaticEventHandler(Object3DStaticArgs e);
         private static event SelectedObjectStaticEventHandler ObjectSelectedStatic = null!;
@@ -48,6 +53,7 @@ namespace HomagGroup.Blazor3D.Viewers
         /// </summary>
         public event LoadedModuleEventHandler JsModuleLoaded = null!;
        
+
 
         /// <summary>
         /// <para><see cref="Settings.ViewerSettings"/> parameter of the component.</para>
@@ -81,34 +87,123 @@ namespace HomagGroup.Blazor3D.Viewers
 
         protected override async Task OnAfterRenderAsync(bool firstRender)
         {
-            if (firstRender)
+            if (!firstRender || IsDisposing) return;
+            SubscribeEvents();
+
+            IJSObjectReference? importedModule = null;
+            try
             {
-                ObjectSelectedStatic += OnObjectSelectedStatic;
-                ObjectLoadedStatic += OnObjectLoadedStatic;
-                ObjectLoadedPrivate += OnObjectLoadedPrivate;
-
-                bundleModule = await JSRuntime.InvokeAsync<IJSObjectReference>(
-                    "import",
-                    "./_content/Blazor3D/js/bundle.js")
-                .AsTask();
-
-                if (UseDefaultScene && !Scene.Children.Any())
-                {
-                    AddDefaultScene();
-                }
-
-                var json = JsonConvert.SerializeObject(new
-                {
-                    Scene = Scene,
-                    ViewerSettings = ViewerSettings,
-                    Camera = Camera,
-                    OrbitControls = OrbitControls,
-                },
-                SerializationHelper.GetSerializerSettings());
-
-                await bundleModule.InvokeVoidAsync("loadViewer", json);
-                await OnModuleLoaded();
+                importedModule = await JSRuntime.InvokeAsync<IJSObjectReference>(
+                    "import", "./_content/DEM.Blazor3D/js/bundle.js");
             }
+            catch (JSDisconnectedException) when (IsDisposing)
+            {
+                return;
+            }
+
+            await lifecycleGate.WaitAsync();
+            try
+            {
+                if (!IsDisposing)
+                {
+                    bundleModule = importedModule;
+                    importedModule = null;
+
+                    if (UseDefaultScene && !Scene.Children.Any()) AddDefaultScene();
+
+                    var json = JsonConvert.SerializeObject(new
+                    {
+                        Scene = Scene,
+                        ViewerSettings = ViewerSettings,
+                        Camera = Camera,
+                        OrbitControls = OrbitControls,
+                    }, SerializationHelper.GetSerializerSettings());
+
+                    await GetBundleModule().InvokeVoidAsync("loadViewer", json);
+                }
+            }
+            catch (Exception) when (IsDisposing)
+            {
+                if (bundleModule is not null)
+                {
+                    var failedModule = bundleModule;
+                    bundleModule = null;
+                    await TryDisposeViewerAsync(failedModule, ViewerSettings?.ContainerId);
+                    await TryDisposeModuleAsync(failedModule);
+                }
+                return;
+            }
+            catch
+            {
+                if (bundleModule is not null)
+                {
+                    var failedModule = bundleModule;
+                    bundleModule = null;
+                    await TryDisposeViewerAsync(failedModule, ViewerSettings?.ContainerId);
+                    await TryDisposeModuleAsync(failedModule);
+                }
+                throw;
+            }
+            finally
+            {
+                lifecycleGate.Release();
+            }
+
+            if (importedModule is not null) await TryDisposeModuleAsync(importedModule);
+            if (!IsDisposing) await OnModuleLoaded();
+        }
+
+        private IJSObjectReference GetBundleModule()
+        {
+            if (IsDisposing || bundleModule is null) throw new ObjectDisposedException(nameof(Viewer));
+            return bundleModule;
+        }
+
+
+        private async Task InvokeBundleVoidAsync(string identifier, params object?[] args)
+        {
+            await lifecycleGate.WaitAsync();
+            try
+            {
+                if (IsDisposing || bundleModule is null) throw new ObjectDisposedException(nameof(Viewer));
+                await bundleModule.InvokeVoidAsync(identifier, args);
+            }
+            finally
+            {
+                lifecycleGate.Release();
+            }
+        }
+
+        private async Task<T> InvokeBundleAsync<T>(string identifier, params object?[] args)
+        {
+            await lifecycleGate.WaitAsync();
+            try
+            {
+                if (IsDisposing || bundleModule is null) throw new ObjectDisposedException(nameof(Viewer));
+                return await bundleModule.InvokeAsync<T>(identifier, args);
+            }
+            finally
+            {
+                lifecycleGate.Release();
+            }
+        }
+
+        private void SubscribeEvents()
+        {
+            if (eventsSubscribed || IsDisposing) return;
+            ObjectSelectedStatic += OnObjectSelectedStatic;
+            ObjectLoadedStatic += OnObjectLoadedStatic;
+            ObjectLoadedPrivate += OnObjectLoadedPrivate;
+            eventsSubscribed = true;
+        }
+
+        private void UnsubscribeEvents()
+        {
+            if (!eventsSubscribed) return;
+            ObjectSelectedStatic -= OnObjectSelectedStatic;
+            ObjectLoadedStatic -= OnObjectLoadedStatic;
+            ObjectLoadedPrivate -= OnObjectLoadedPrivate;
+            eventsSubscribed = false;
         }
 
         /// <summary>
@@ -118,7 +213,7 @@ namespace HomagGroup.Blazor3D.Viewers
         public async Task UpdateScene()
         {
             var json = JsonConvert.SerializeObject(Scene, SerializationHelper.GetSerializerSettings());
-            await bundleModule.InvokeVoidAsync("updateScene", json);
+            await InvokeBundleVoidAsync("updateScene", json);
         }
 
         /// <summary>
@@ -129,10 +224,8 @@ namespace HomagGroup.Blazor3D.Viewers
         /// <returns>Task</returns>
         public async Task SetCameraPositionAsync(Vector3 position, Vector3 lookAt = null!)
         {
-            await bundleModule.InvokeVoidAsync("setCameraPosition", position, lookAt);
+            await InvokeBundleVoidAsync("setCameraPosition", position, lookAt);
         }
-
-        
 
         /// <summary>
         /// Apply updated camera settings to viewer.
@@ -142,7 +235,7 @@ namespace HomagGroup.Blazor3D.Viewers
         {
             Camera = camera;
             var json = JsonConvert.SerializeObject(Camera, SerializationHelper.GetSerializerSettings());
-            await bundleModule.InvokeVoidAsync("updateCamera", json);
+            await InvokeBundleVoidAsync("updateCamera", json);
         }
 
         /// <summary>
@@ -151,7 +244,7 @@ namespace HomagGroup.Blazor3D.Viewers
         /// <returns>Task</returns>
         public async Task ShowCurrentCameraInfo()
         {
-            await bundleModule.InvokeVoidAsync("showCurrentCameraInfo");
+            await InvokeBundleVoidAsync("showCurrentCameraInfo");
         }
 
         /// <summary>
@@ -163,7 +256,7 @@ namespace HomagGroup.Blazor3D.Viewers
         {
             OrbitControls = orbitControls;
             var json = JsonConvert.SerializeObject(OrbitControls, SerializationHelper.GetSerializerSettings());
-            await bundleModule.InvokeVoidAsync("updateOrbitControls", json);
+            await InvokeBundleVoidAsync("updateOrbitControls", json);
         }
 
         [JSInvokable]
@@ -198,7 +291,7 @@ namespace HomagGroup.Blazor3D.Viewers
         /// <returns>Task</returns>
         public async Task RemoveByUuidAsync(Guid uuid)
         {
-            var result = await bundleModule.InvokeAsync<bool>("removeByUuid", uuid);
+            var result = await InvokeBundleAsync<bool>("removeByUuid", uuid);
             if (result)
             {
                 ChildrenHelper.RemoveObjectByUuid(uuid, Scene.Children);
@@ -212,7 +305,7 @@ namespace HomagGroup.Blazor3D.Viewers
         /// <returns>Task</returns>
         public async Task SelectByUuidAsync(Guid uuid)
         {
-            await bundleModule.InvokeVoidAsync("selectByUuid", uuid);
+            await InvokeBundleVoidAsync("selectByUuid", uuid);
         }
 
         /// <summary>
@@ -221,7 +314,7 @@ namespace HomagGroup.Blazor3D.Viewers
         /// <returns>Task</returns>
         public async Task ClearSceneAsync()
         {
-            await bundleModule.InvokeVoidAsync("clearScene");
+            await InvokeBundleVoidAsync("clearScene");
             Scene.Children.Clear();
         }
 
@@ -235,7 +328,7 @@ namespace HomagGroup.Blazor3D.Viewers
             settings.Uuid = settings.Uuid ?? Guid.NewGuid();
             settings.Material = settings.Material ?? new MeshStandardMaterial();
             var json = JsonConvert.SerializeObject(settings, SerializationHelper.GetSerializerSettings());
-            await bundleModule.InvokeVoidAsync("import3DModel", json);
+            await InvokeBundleVoidAsync("import3DModel", json);
             return settings.Uuid.Value;
         }
 
@@ -249,7 +342,7 @@ namespace HomagGroup.Blazor3D.Viewers
             settings.Uuid = settings.Uuid ?? Guid.NewGuid();
             settings.Material = settings.Material ?? new SpriteMaterial();
             var json = JsonConvert.SerializeObject(settings, SerializationHelper.GetSerializerSettings());
-            await bundleModule.InvokeVoidAsync("importSprite", json);
+            await InvokeBundleVoidAsync("importSprite", json);
             return settings.Uuid.Value;
         }
 
@@ -266,6 +359,11 @@ namespace HomagGroup.Blazor3D.Viewers
 
         private async Task OnModuleLoaded()
         {
+            if (IsDisposing)
+            {
+                return;
+            }
+
             LoadedModuleEventHandler handler = JsModuleLoaded;
 
             if (handler == null)
@@ -278,6 +376,10 @@ namespace HomagGroup.Blazor3D.Viewers
 
             for (int i = 0; i < invocationList.Length; i++)
             {
+                if (IsDisposing)
+                {
+                    return;
+                }
                 handlerTasks[i] = ((LoadedModuleEventHandler)invocationList[i])();
             }
 
@@ -302,7 +404,7 @@ namespace HomagGroup.Blazor3D.Viewers
 
         private void OnObjectSelectedStatic(Object3DStaticArgs e)
         {
-            if (ViewerSettings.ContainerId == e.ContainerId)
+            if (!IsDisposing && ViewerSettings.ContainerId == e.ContainerId)
             {
                 ObjectSelected?.Invoke(new Object3DArgs() { UUID = e.UUID });
             }
@@ -310,7 +412,7 @@ namespace HomagGroup.Blazor3D.Viewers
 
         private void OnObjectLoadedStatic(Object3DStaticArgs e)
         {
-            if (ViewerSettings.ContainerId == e.ContainerId)
+            if (!IsDisposing && ViewerSettings.ContainerId == e.ContainerId)
             {
                 ObjectLoadedPrivate?.Invoke(new Object3DArgs() { UUID = e.UUID });
             }
@@ -363,7 +465,26 @@ namespace HomagGroup.Blazor3D.Viewers
 
         private async Task OnObjectLoadedPrivate(Object3DArgs e)
         {
-            var json = await bundleModule.InvokeAsync<string>("getSceneItemByGuid", e.UUID);
+            if (IsDisposing || bundleModule is null)
+            {
+                return;
+            }
+
+            string json;
+            try
+            {
+                json = await InvokeBundleAsync<string>("getSceneItemByGuid", e.UUID);
+            }
+            catch (Exception) when (IsDisposing)
+            {
+                return;
+            }
+
+            if (IsDisposing || string.IsNullOrEmpty(json))
+            {
+                return;
+            }
+
             if (json.Contains("\"type\":\"Group\""))
             {
                 var jobject = JObject.Parse(json);
@@ -378,6 +499,7 @@ namespace HomagGroup.Blazor3D.Viewers
                 };
                 group.Children.AddRange(childrenResult);
 
+                if (IsDisposing) return;
                 Scene.Children.Add(group);
                 ObjectLoaded?.Invoke(new Object3DArgs() { UUID = e.UUID });
             }
@@ -385,7 +507,7 @@ namespace HomagGroup.Blazor3D.Viewers
             if (json.Contains("\"type\":\"Mesh\""))
             {
                 var mesh = JsonConvert.DeserializeObject<Mesh>(json);
-                if (mesh != null)
+                if (mesh != null && !IsDisposing)
                 {
                     Scene.Children.Add(mesh);
                     ObjectLoaded?.Invoke(new Object3DArgs() { UUID = e.UUID });
@@ -395,7 +517,7 @@ namespace HomagGroup.Blazor3D.Viewers
             if (json.Contains("\"type\":\"Sprite\""))
             {
                 var sprite = JsonConvert.DeserializeObject<Sprite>(json);
-                if (sprite != null)
+                if (sprite != null && !IsDisposing)
                 {
                     Scene.Children.Add(sprite);
                     ObjectLoaded?.Invoke(new Object3DArgs() { UUID= e.UUID });
@@ -403,11 +525,65 @@ namespace HomagGroup.Blazor3D.Viewers
             }
         }
 
+        private static async Task TryDisposeViewerAsync(IJSObjectReference module, string? containerId)
+        {
+            try
+            {
+                await module.InvokeVoidAsync("disposeViewer", containerId);
+            }
+            catch (Exception ex) when (ex is JSDisconnectedException || ex is JSException || ex is ObjectDisposedException || ex is InvalidOperationException)
+            {
+            }
+        }
+
+        private static async Task TryDisposeModuleAsync(IJSObjectReference module)
+        {
+            try
+            {
+                await module.DisposeAsync();
+            }
+            catch (Exception ex) when (ex is JSDisconnectedException || ex is JSException || ex is ObjectDisposedException || ex is InvalidOperationException)
+            {
+            }
+        }
+
         public void Dispose()
         {
-            ObjectSelectedStatic -= OnObjectSelectedStatic;
-            ObjectLoadedStatic -= OnObjectLoadedStatic;
-            ObjectLoadedPrivate -= OnObjectLoadedPrivate;
+            _ = DisposeAndLogFailuresAsync();
+        }
+
+        private async Task DisposeAndLogFailuresAsync()
+        {
+            try
+            {
+                await DisposeAsync();
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Trace.TraceError("Blazor3D viewer disposal failed: {0}", ex);
+            }
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            if (Interlocked.Exchange(ref disposeStarted, 1) != 0) return;
+            UnsubscribeEvents();
+
+            await lifecycleGate.WaitAsync();
+            try
+            {
+                var module = bundleModule;
+                bundleModule = null;
+                if (module is not null)
+                {
+                    await TryDisposeViewerAsync(module, ViewerSettings?.ContainerId);
+                    await TryDisposeModuleAsync(module);
+                }
+            }
+            finally
+            {
+                lifecycleGate.Release();
+            }
         }
     }
 }

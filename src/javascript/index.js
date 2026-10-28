@@ -3,18 +3,53 @@ import Viewer3D from "./Viewer/Viewer3D";
 let viewer3d;
 
 const resizeObserver = new ResizeObserver((entries) => {
-  viewer3d.onResize();
+  // The module supports one active viewer; ignore notifications for any stale
+  // container that may have been observed before teardown.
+  if (viewer3d && entries.some(entry => entry.target === viewer3d.container)) {
+    viewer3d.onResize();
+  }
 });
+
+// DOM removal is observable even if Blazor's server circuit cannot run JS.
+// If your app has a stable, narrower root, observe that instead of body.
+const removalObserver = new MutationObserver(() => {
+  if (viewer3d && (!viewer3d.container?.isConnected ||
+      !viewer3d.renderer?.domElement?.isConnected)) {
+    viewer3d.dispose();
+  }
+});
+
+function onViewerDisposed(instance) {
+  if (viewer3d !== instance) return;
+  resizeObserver.disconnect();
+  removalObserver.disconnect();
+  viewer3d = null;
+}
 
 export function loadViewer(json) {
   const options = JSON.parse(json);
-  let container = document.getElementById(options.viewerSettings.containerId);
+  const containerId = options.viewerSettings.containerId;
+  const container = document.getElementById(containerId);
   if (!container) {
     console.warn("Container not found!");
     return;
   }
+
+  // The upstream module supports one active viewer. Release the previous
+  // instance before assigning another, including when container IDs repeat.
+  viewer3d?.dispose();
+
+  viewer3d = new Viewer3D(options, container, onViewerDisposed);
   resizeObserver.observe(container);
-  viewer3d = new Viewer3D(options, container);
+  removalObserver.observe(document.body, { childList: true, subtree: true });
+}
+
+// Called by the Blazor component during disposal. The container ID prevents a
+// late disposal call from tearing down a newer viewer instance.
+export function disposeViewer(containerId) {
+  if (viewer3d?.options?.viewerSettings?.containerId === containerId) {
+    viewer3d.dispose();
+  }
 }
 
 export function updateScene(json) {

@@ -7,6 +7,10 @@ import SceneBuilder from "../Builders/SceneBuilder";
 import CameraBuilder from "../Builders/CameraBuilder";
 import Transforms from "../Utils/Transforms";
 import { ViewHelper } from "three/examples/jsm/helpers/ViewHelper";
+import disposeOwnedResources, {
+  disposeResourcesNotIn,
+  disposeTextures,
+} from "../Utils/DisposeOwnedResources";
 
 class Viewer3D {
   thetaX = 0;
@@ -18,7 +22,11 @@ class Viewer3D {
   INTERSECTED = null;
   clock = null;
 
-  constructor(options, container) {
+  constructor(options, container, onDisposed = null) {
+    this.disposed = false;
+    this.animationFrameId = null;
+    this.sceneGeneration = 0;
+    this.onDisposed = onDisposed;
     this.options = options;
     this.container = container;
     this.clock = new THREE.Clock();
@@ -26,22 +34,22 @@ class Viewer3D {
     this.scene = new THREE.Scene();
     this.setScene();
 
-    this.renderer = new THREE.WebGLRenderer(
-      {
-        antialias: this.options.viewerSettings.webGLRendererSettings.antialias,
-        premultipliedAlpha: this.options.viewerSettings.webGLRendererSettings.premultipliedAlpha,
-        alpha: this.options.viewerSettings.webGLRendererSettings.alpha,
-      }
-    );
+    this.renderer = new THREE.WebGLRenderer({
+      antialias: this.options.viewerSettings.webGLRendererSettings.antialias,
+      premultipliedAlpha:
+        this.options.viewerSettings.webGLRendererSettings.premultipliedAlpha,
+      alpha: this.options.viewerSettings.webGLRendererSettings.alpha,
+    });
 
     if (this.options.viewerSettings.showViewHelper) {
       this.renderer.autoClear = false;
-    };
+    }
 
     this.renderer.domElement.style.width = "100%";
     this.renderer.domElement.style.height = "100%";
 
     this.renderer.domElement.onclick = (event) => {
+      if (this.disposed) return;
       if (this.options.viewerSettings.canSelect == true) {
         this.selectObject(event);
       }
@@ -60,17 +68,42 @@ class Viewer3D {
     this.onResize();
 
     const animate = () => {
-      this.controls.update();
-      requestAnimationFrame(animate);
-      this.render();
+      // The callback may already be running when dispose() is called.
+      this.animationFrameId = null;
+      if (this.disposed) return;
+      if (
+        !this.container?.isConnected ||
+        !this.renderer?.domElement?.isConnected
+      ) {
+        this.dispose();
+        return;
+      }
+
+      try {
+        this.controls?.update();
+        this.render();
+      } catch (error) {
+        console.error(
+          "Blazor3D render loop failed; disposing the viewer.",
+          error,
+        );
+        this.dispose();
+        return;
+      }
+
+      // render() or a callback may have disposed the viewer synchronously.
+      if (!this.disposed) {
+        this.animationFrameId = requestAnimationFrame(animate);
+      }
     };
-    
+
     animate();
   }
 
   render() {
-      this.rotateCamera();
-      this.animateObjects();
+    if (this.disposed) return;
+    this.rotateCamera();
+    this.animateObjects();
 
     if (this.options.viewerSettings.showViewHelper && this.viewHelper) {
       this.renderer.clear();
@@ -84,40 +117,48 @@ class Viewer3D {
   }
 
   onResize() {
-    this.camera.aspect =
-      this.container.offsetWidth / this.container.offsetHeight;
+    if (this.disposed || !this.container || !this.renderer || !this.camera) {
+      return;
+    }
 
-    if (
-      this.camera.isOrthographicCamera &&
-      this.options &&
-      this.options.camera
-    ) {
-      this.camera.left = this.options.camera.left * this.camera.aspect;
-      this.camera.right = this.options.camera.right * this.camera.aspect;
+    const width = this.container.offsetWidth;
+    const height = this.container.offsetHeight;
+
+    // The viewer may be hidden
+    if (width <= 0 || height <= 0) {
+      return;
+    }
+
+    const aspect = width / height;
+
+    if (!Number.isFinite(aspect) || aspect <= 0) {
+      return;
+    }
+
+    this.camera.aspect = aspect;
+
+    if (this.camera.isOrthographicCamera && this.options?.camera) {
+      this.camera.left = this.options.camera.left * aspect;
+      this.camera.right = this.options.camera.right * aspect;
     }
 
     this.camera.updateProjectionMatrix();
-
-    this.renderer.setSize(
-      this.container.offsetWidth,
-      this.container.offsetHeight,
-      false // required
-    );
+    this.renderer.setSize(width, height, false);
   }
 
   setScene() {
-    if (this.options.scene.backGroundColor){
-      this.scene.background = new THREE.Color(this.options.scene.backGroundColor);
+    if (this.options.scene.backGroundColor) {
+      this.scene.background = new THREE.Color(
+        this.options.scene.backGroundColor,
+      );
     }
-    
+
     this.scene.uuid = this.options.scene.uuid;
 
     this.options.scene.children.forEach((childOptions) => {
       if (childOptions.type == "Text") {
-        
         TextBuilder.BuildText(childOptions, this.scene);
-      }
-      else {
+      } else {
         var child = SceneBuilder.BuildChild(childOptions, this.scene);
         if (child) {
           this.scene.add(child);
@@ -127,18 +168,33 @@ class Viewer3D {
   }
 
   updateScene(sceneOptions) {
+    if (this.disposed) return;
     this.clearScene();
     this.options.scene = sceneOptions;
     this.setScene();
   }
 
-  setCamera() {
-    this.camera = CameraBuilder.BuildCamera(
-      this.options.camera,
-      this.container.offsetWidth / this.container.offsetHeight
-    );
+  disposeViewHelper() {
+    const viewHelper = this.viewHelper;
+    this.viewHelper = null;
+    if (viewHelper) disposeOwnedResources(viewHelper);
+  }
 
-    if (this.options.viewerSettings.showViewHelper && this.camera && this.renderer && this.renderer.domElement) {
+  setCamera() {
+    this.disposeViewHelper();
+
+    const width = this.container?.offsetWidth ?? 0;
+    const height = this.container?.offsetHeight ?? 0;
+    const aspect = width > 0 && height > 0 ? width / height : 1;
+
+    this.camera = CameraBuilder.BuildCamera(this.options.camera, aspect);
+
+    if (
+      this.options.viewerSettings.showViewHelper &&
+      this.camera &&
+      this.renderer &&
+      this.renderer.domElement
+    ) {
       this.viewHelper = new ViewHelper(this.camera, this.renderer.domElement);
     }
 
@@ -155,12 +211,12 @@ class Viewer3D {
     let cameraAnimationSettings = this.options.camera.animateRotationSettings;
 
     if (
-        !cameraAnimationSettings ||
-        cameraAnimationSettings.animateRotation === false
-    ){
+      !cameraAnimationSettings ||
+      cameraAnimationSettings.animateRotation === false
+    ) {
       return;
     }
-      
+
     let radius = cameraAnimationSettings.radius;
 
     this.thetaX = this.thetaX + cameraAnimationSettings.thetaX;
@@ -168,45 +224,70 @@ class Viewer3D {
     this.thetaZ = this.thetaZ + cameraAnimationSettings.thetaZ;
 
     this.camera.position.x =
-        cameraAnimationSettings.thetaX === 0
-            ? this.camera.position.x
-            : radius * Math.sin(THREE.MathUtils.degToRad(this.thetaX));
+      cameraAnimationSettings.thetaX === 0
+        ? this.camera.position.x
+        : radius * Math.sin(THREE.MathUtils.degToRad(this.thetaX));
     this.camera.position.y =
-        cameraAnimationSettings.thetaY === 0
-            ? this.camera.position.y
-            : radius * Math.sin(THREE.MathUtils.degToRad(this.thetaY));
+      cameraAnimationSettings.thetaY === 0
+        ? this.camera.position.y
+        : radius * Math.sin(THREE.MathUtils.degToRad(this.thetaY));
     this.camera.position.z =
-        cameraAnimationSettings.thetaZ === 0
-            ? this.camera.position.z
-            : radius * Math.cos(THREE.MathUtils.degToRad(this.thetaZ));
+      cameraAnimationSettings.thetaZ === 0
+        ? this.camera.position.z
+        : radius * Math.cos(THREE.MathUtils.degToRad(this.thetaZ));
     let { x, y, z } = this.options.camera.lookAt;
     this.camera.lookAt(x, y, z);
     this.camera.updateMatrixWorld();
   }
-  
-  animateObjects(){
-    const objectsToAnimate = this.options.scene.children.filter(x => x.animateObject3DSettings?.animateObject === true);
-    objectsToAnimate.forEach(object3dOptions => {
-      const object3d = this.scene.children.find(x => x.uuid === object3dOptions.uuid)
+
+  animateObjects() {
+    const objectsToAnimate = this.options.scene.children.filter(
+      (x) => x.animateObject3DSettings?.animateObject === true,
+    );
+    objectsToAnimate.forEach((object3dOptions) => {
+      const object3d = this.scene.getObjectByProperty(
+        "uuid",
+        object3dOptions.uuid,
+      );
       const animationSettings = object3dOptions.animateObject3DSettings;
-      
-      if (animationSettings.points.length === animationSettings.indexPointer){
-        if (animationSettings.loopAnimation === false){
+      if (
+        !object3d?.position ||
+        !Array.isArray(animationSettings.points) ||
+        animationSettings.points.length === 0
+      ) {
+        animationSettings.animateObject = false;
+        return;
+      }
+
+      if (animationSettings.points.length === animationSettings.indexPointer) {
+        if (animationSettings.loopAnimation === false) {
           animationSettings.animateObject = false;
           return;
         }
         animationSettings.indexPointer = 0;
-        object3d.position.copy(new THREE.Vector3(animationSettings.points[0].x, animationSettings.points[0].y, animationSettings.points[0].z))
+        object3d.position.copy(
+          new THREE.Vector3(
+            animationSettings.points[0].x,
+            animationSettings.points[0].y,
+            animationSettings.points[0].z,
+          ),
+        );
       }
-      
-      const {x, y, z} = animationSettings.points[animationSettings.indexPointer];
-      
+
+      const { x, y, z } =
+        animationSettings.points[animationSettings.indexPointer];
+
       const target = new THREE.Vector3(x, y, z).sub(object3d.position);
       target.normalize();
-      
-      object3d.translateOnAxis(target, this.clock.getDelta() * animationSettings.speed);
 
-      const distance = new THREE.Vector3(x, y, z).sub(object3d.position).length();
+      object3d.translateOnAxis(
+        target,
+        this.clock.getDelta() * animationSettings.speed,
+      );
+
+      const distance = new THREE.Vector3(x, y, z)
+        .sub(object3d.position)
+        .length();
       if (distance < 0.1) {
         animationSettings.indexPointer++;
       }
@@ -214,11 +295,12 @@ class Viewer3D {
   }
 
   showCurrentCameraInfo() {
-    console.log('Current camera info:', this.camera);
-    console.log('Orbit controls info:', this.controls);
+    console.log("Current camera info:", this.camera);
+    console.log("Orbit controls info:", this.controls);
   }
 
   setOrbitControls() {
+    this.controls?.dispose();
     this.controls = new OrbitControls(this.camera, this.renderer.domElement);
     this.controls.screenSpacePanning = true;
     this.controls.minDistance = this.options.orbitControls.minDistance;
@@ -237,18 +319,38 @@ class Viewer3D {
   }
 
   import3DModel(settings) {
+    if (this.disposed || !this.scene) return null;
+
+    const scene = this.scene;
+    const generation = this.sceneGeneration;
+    const isActive = () =>
+      !this.disposed &&
+      this.scene === scene &&
+      this.sceneGeneration === generation;
+
     return Loaders.import3DModel(
-      this.scene,
+      scene,
       settings,
-      this.options.viewerSettings.containerId
+      this.options.viewerSettings.containerId,
+      isActive,
     );
   }
 
   importSprite(settings) {
+    if (this.disposed || !this.scene) return null;
+
+    const scene = this.scene;
+    const generation = this.sceneGeneration;
+    const isActive = () =>
+      !this.disposed &&
+      this.scene === scene &&
+      this.sceneGeneration === generation;
+
     return Loaders.importSprite(
-      this.scene,
+      scene,
       settings,
-      this.options.viewerSettings.containerId
+      this.options.viewerSettings.containerId,
+      isActive,
     );
   }
 
@@ -288,7 +390,7 @@ class Viewer3D {
     this.raycaster.setFromCamera(this.mouse, this.camera);
     const intersects = this.raycaster.intersectObjects(
       this.scene.children,
-      true
+      true,
     );
 
     if (intersects.length == 0) {
@@ -301,7 +403,7 @@ class Viewer3D {
         "Blazor3D",
         "ReceiveSelectedObjectUUID",
         this.options.viewerSettings.containerId,
-        null
+        null,
       );
       return;
     }
@@ -316,12 +418,11 @@ class Viewer3D {
     }
 
     if (this.INTERSECTED) {
-
       DotNet.invokeMethodAsync(
         "Blazor3D",
         "ReceiveSelectedObjectUUID",
         this.options.viewerSettings.containerId,
-        this.INTERSECTED.uuid
+        this.INTERSECTED.uuid,
       );
     }
   }
@@ -345,25 +446,129 @@ class Viewer3D {
   }
 
   removeByUuid(uuid) {
-    let obj = this.scene.getObjectByProperty("uuid", uuid);
-    if (obj) {
-      this.scene.remove(obj);
-      return true;
+    if (this.disposed || !this.scene) return false;
+
+    const obj = this.scene.getObjectByProperty("uuid", uuid);
+    if (!obj || !obj.parent) return false;
+
+    // Remove from the actual parent, including when the UUID belongs to a child.
+    obj.parent.remove(obj);
+
+    // Preserve resources shared with objects that remain in the scene, and
+    // textures still referenced by the scene background or environment.
+    const keepResources = new Set(
+      [this.scene.background, this.scene.environment].filter(
+        (value) => value?.isTexture,
+      ),
+    );
+    disposeResourcesNotIn(obj, this.scene, keepResources);
+    this.removeSceneOptionsByUuid(this.options?.scene?.children, uuid);
+
+    if (
+      this.INTERSECTED &&
+      (this.INTERSECTED === obj ||
+        obj.getObjectById(this.INTERSECTED.id) === this.INTERSECTED)
+    ) {
+      this.INTERSECTED = null;
     }
-    return false;
+
+    this.renderer?.renderLists?.dispose();
+    return true;
+  }
+
+  removeSceneOptionsByUuid(children, uuid) {
+    if (!Array.isArray(children)) return false;
+    let removed = false;
+    for (let index = children.length - 1; index >= 0; index--) {
+      const child = children[index];
+      if (child?.uuid === uuid) {
+        children.splice(index, 1);
+        removed = true;
+      } else if (Array.isArray(child?.children)) {
+        removed =
+          this.removeSceneOptionsByUuid(child.children, uuid) || removed;
+      }
+    }
+    return removed;
   }
 
   selectByUuid(uuid) {
     let obj = this.scene.getObjectByProperty("uuid", uuid);
     if (obj) {
-      this.processSelection(obj)
+      this.processSelection(obj);
       return true;
     }
     return false;
   }
 
   clearScene() {
+    if (!this.scene) return;
+    this.sceneGeneration++;
+
+    // These properties survive scene.clear(), so leave their textures alive
+    // until the viewer itself is disposed.
+    const keepTextures = new Set(
+      [this.scene.background, this.scene.environment].filter(
+        (value) => value?.isTexture,
+      ),
+    );
+    this.INTERSECTED = null;
+    disposeOwnedResources(this.scene, keepTextures);
     this.scene.clear();
+    this.renderer?.renderLists?.dispose();
+  }
+
+  dispose() {
+    if (this.disposed) return;
+    this.disposed = true;
+    if (this.animationFrameId !== null) {
+      cancelAnimationFrame(this.animationFrameId);
+      this.animationFrameId = null;
+    }
+
+    const notifyDisposed = this.onDisposed;
+    this.onDisposed = null;
+    const canvas = this.renderer?.domElement;
+    const cleanup = (label, action) => {
+      try {
+        action();
+      } catch (error) {
+        // Continue releasing other resources if one cleanup operation fails.
+        console.warn(`Failed to clean up viewer ${label}.`, error);
+      }
+    };
+
+    try {
+      cleanup("orbit controls", () => this.controls?.dispose());
+      cleanup("view helper resources", () => this.disposeViewHelper());
+      cleanup("scene resources", () => this.clearScene());
+
+      const sceneTextures = new Set(
+        [this.scene?.background, this.scene?.environment].filter(
+          (value) => value?.isTexture,
+        ),
+      );
+      cleanup("scene textures", () => disposeTextures(sceneTextures));
+
+      cleanup("canvas event handler", () => {
+        if (canvas) canvas.onclick = null;
+      });
+      cleanup("renderer", () => this.renderer?.dispose());
+      cleanup("canvas removal", () => canvas?.remove());
+    } finally {
+      this.INTERSECTED = null;
+      this.options = null;
+      this.scene = null;
+      this.camera = null;
+      this.controls = null;
+      this.viewHelper = null;
+      this.renderer = null;
+      this.container = null;
+      this.clock = null;
+      this.mouse = null;
+      this.raycaster = null;
+      cleanup("disposal notification", () => notifyDisposed?.(this));
+    }
   }
 
   processSelection(objToSelect) {
@@ -374,7 +579,7 @@ class Viewer3D {
       this.INTERSECTED = objToSelect;
       this.INTERSECTED.currentHex = this.INTERSECTED.material.color.getHex();
       this.INTERSECTED.material.color.setHex(
-        new THREE.Color(this.options.viewerSettings.selectedColor).getHex()
+        new THREE.Color(this.options.viewerSettings.selectedColor).getHex(),
       );
     }
   }
