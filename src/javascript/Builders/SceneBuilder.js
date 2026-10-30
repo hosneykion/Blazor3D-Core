@@ -1,3 +1,4 @@
+import TextBuilder from "./TextBuilder";
 import HelperBuilder from "./HelperBuilder";
 import LightBuilder from "./LightBuilder";
 import MeshBuilder from "./MeshBuilder";
@@ -7,7 +8,11 @@ import SpriteBuilder from "./SpriteBuilder";
 
 class SceneBuilder {
 
-  static BuildChild(options, scene) {
+  static BuildChild(options, scene, textLoads, rootScene = scene, pendingHelpers = null) {
+    if (options.type == "Text") {
+      TextBuilder.BuildText(options, scene, textLoads);
+      return null;
+    }
     if (options.type == "Mesh") {
       return MeshBuilder.BuildMesh(options);
     }
@@ -21,7 +26,7 @@ class SceneBuilder {
     }
 
     if (options.type == "Group") {
-      return GroupBuilder.BuildGroup(options);
+      return GroupBuilder.BuildGroup(options, scene, textLoads, rootScene, pendingHelpers);
     }
 
     if (options.type == "AmbientLight") {
@@ -33,12 +38,23 @@ class SceneBuilder {
     }
 
     if (options.type.includes("Helper")) {
-      return HelperBuilder.BuildHelper(options, scene);
+      if (pendingHelpers) {
+        pendingHelpers.push({ options, parent: scene, rootScene });
+        return null;
+      }
+      return HelperBuilder.BuildHelper(options, scene, rootScene);
     }
 
     if (options.type.includes("Sprite")) {
       return SpriteBuilder.BuildSprite(options);
     }
+  }
+
+  static BuildPendingHelpers(pendingHelpers) {
+    pendingHelpers.forEach(({ options, parent, rootScene }) => {
+      const helper = HelperBuilder.BuildHelper(options, parent, rootScene);
+      if (helper) parent.add(helper);
+    });
   }
 }
 

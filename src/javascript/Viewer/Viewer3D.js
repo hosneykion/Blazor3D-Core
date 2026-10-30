@@ -1,3 +1,4 @@
+import TextLoadScope from "../Utils/TextLoadScope";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls";
 import Loaders from "./Loaders";
@@ -22,8 +23,11 @@ class Viewer3D {
   INTERSECTED = null;
   clock = null;
 
-  constructor(options, container, onDisposed = null) {
+  constructor(options, container, onDisposed = null, instanceId = null) {
     this.disposed = false;
+    this.paused = false;
+    this.instanceId = instanceId ?? options.viewerSettings.containerId;
+    this.textLoads = new TextLoadScope();
     this.animationFrameId = null;
     this.sceneGeneration = 0;
     this.onDisposed = onDisposed;
@@ -67,37 +71,54 @@ class Viewer3D {
     this.setOrbitControls();
     this.onResize();
 
-    const animate = () => {
-      // The callback may already be running when dispose() is called.
+    this.animateFrame = this.animateFrame.bind(this);
+    this.animateFrame();
+  }
+
+  animateFrame() {
+    this.animationFrameId = null;
+    if (this.disposed || this.paused) return;
+    if (
+      !this.container?.isConnected ||
+      !this.renderer?.domElement?.isConnected
+    ) {
+      this.dispose();
+      return;
+    }
+
+    try {
+      this.controls?.update();
+      this.render();
+    } catch (error) {
+      console.error(
+        "Blazor3D render loop failed; disposing the viewer.",
+        error,
+      );
+      this.dispose();
+      return;
+    }
+
+    if (!this.disposed && !this.paused) {
+      this.animationFrameId = requestAnimationFrame(this.animateFrame);
+    }
+  }
+
+  pause() {
+    if (this.disposed || this.paused) return;
+    this.paused = true;
+    if (this.animationFrameId !== null) {
+      cancelAnimationFrame(this.animationFrameId);
       this.animationFrameId = null;
-      if (this.disposed) return;
-      if (
-        !this.container?.isConnected ||
-        !this.renderer?.domElement?.isConnected
-      ) {
-        this.dispose();
-        return;
-      }
+    }
+    this.clock?.stop();
+  }
 
-      try {
-        this.controls?.update();
-        this.render();
-      } catch (error) {
-        console.error(
-          "Blazor3D render loop failed; disposing the viewer.",
-          error,
-        );
-        this.dispose();
-        return;
-      }
-
-      // render() or a callback may have disposed the viewer synchronously.
-      if (!this.disposed) {
-        this.animationFrameId = requestAnimationFrame(animate);
-      }
-    };
-
-    animate();
+  resume() {
+    if (this.disposed || !this.paused) return;
+    this.paused = false;
+    this.clock?.start();
+    this.onResize();
+    this.animateFrame();
   }
 
   render() {
@@ -154,17 +175,26 @@ class Viewer3D {
     }
 
     this.scene.uuid = this.options.scene.uuid;
+    const pendingHelpers = [];
 
     this.options.scene.children.forEach((childOptions) => {
       if (childOptions.type == "Text") {
-        TextBuilder.BuildText(childOptions, this.scene);
+        TextBuilder.BuildText(childOptions, this.scene, this.textLoads);
       } else {
-        var child = SceneBuilder.BuildChild(childOptions, this.scene);
+        var child = SceneBuilder.BuildChild(
+          childOptions,
+          this.scene,
+          this.textLoads,
+          this.scene,
+          pendingHelpers,
+        );
         if (child) {
           this.scene.add(child);
         }
       }
     });
+
+    SceneBuilder.BuildPendingHelpers(pendingHelpers);
   }
 
   updateScene(sceneOptions) {
@@ -328,12 +358,7 @@ class Viewer3D {
       this.scene === scene &&
       this.sceneGeneration === generation;
 
-    return Loaders.import3DModel(
-      scene,
-      settings,
-      this.options.viewerSettings.containerId,
-      isActive,
-    );
+    return Loaders.import3DModel(scene, settings, this.instanceId, isActive);
   }
 
   importSprite(settings) {
@@ -346,16 +371,12 @@ class Viewer3D {
       this.scene === scene &&
       this.sceneGeneration === generation;
 
-    return Loaders.importSprite(
-      scene,
-      settings,
-      this.options.viewerSettings.containerId,
-      isActive,
-    );
+    return Loaders.importSprite(scene, settings, this.instanceId, isActive);
   }
 
   getSceneItemByGuid(guid) {
     let item = this.scene.getObjectByProperty("uuid", guid);
+    if (!item) return null;
 
     return {
       uuid: item.uuid,
@@ -402,9 +423,16 @@ class Viewer3D {
       DotNet.invokeMethodAsync(
         "Blazor3D",
         "ReceiveSelectedObjectUUID",
-        this.options.viewerSettings.containerId,
+        this.instanceId,
         null,
-      );
+      ).catch((error) => {
+        if (!this.disposed) {
+          console.error(
+            "Blazor3D failed to report the cleared selection.",
+            error,
+          );
+        }
+      });
       return;
     }
 
@@ -421,9 +449,16 @@ class Viewer3D {
       DotNet.invokeMethodAsync(
         "Blazor3D",
         "ReceiveSelectedObjectUUID",
-        this.options.viewerSettings.containerId,
+        this.instanceId,
         this.INTERSECTED.uuid,
-      );
+      ).catch((error) => {
+        if (!this.disposed) {
+          console.error(
+            "Blazor3D failed to report the selected object.",
+            error,
+          );
+        }
+      });
     }
   }
 
@@ -504,6 +539,7 @@ class Viewer3D {
   clearScene() {
     if (!this.scene) return;
     this.sceneGeneration++;
+    this.textLoads?.clear();
 
     // These properties survive scene.clear(), so leave their textures alive
     // until the viewer itself is disposed.
@@ -515,6 +551,7 @@ class Viewer3D {
     this.INTERSECTED = null;
     disposeOwnedResources(this.scene, keepTextures);
     this.scene.clear();
+    if (this.options?.scene) this.options.scene.children = [];
     this.renderer?.renderLists?.dispose();
   }
 
@@ -554,8 +591,18 @@ class Viewer3D {
         if (canvas) canvas.onclick = null;
       });
       cleanup("renderer", () => this.renderer?.dispose());
+      // This renderer is permanently retired, not temporarily hidden.
+      cleanup("WebGL context", () => this.renderer?.forceContextLoss());
+      cleanup("canvas backing store", () => {
+        if (canvas) {
+          canvas.width = 1;
+          canvas.height = 1;
+        }
+      });
       cleanup("canvas removal", () => canvas?.remove());
     } finally {
+      this.textLoads?.dispose();
+      this.textLoads = null;
       this.INTERSECTED = null;
       this.options = null;
       this.scene = null;

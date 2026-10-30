@@ -1918,6 +1918,12 @@
             </summary>
             <returns>Task</returns>
         </member>
+        <member name="M:HomagGroup.Blazor3D.Viewers.Viewer.PauseRendering">
+            <summary>Pauses rendering while preserving the viewer and its scene.</summary>
+        </member>
+        <member name="M:HomagGroup.Blazor3D.Viewers.Viewer.ResumeRendering">
+            <summary>Resumes rendering and renders the current scene.</summary>
+        </member>
         <member name="M:HomagGroup.Blazor3D.Viewers.Viewer.SetCameraPositionAsync(HomagGroup.Blazor3D.Maths.Vector3,HomagGroup.Blazor3D.Maths.Vector3)">
             <summary>
             <para>Sets the camera position to specified <see cref="T:HomagGroup.Blazor3D.Maths.Vector3"/> value.</para>

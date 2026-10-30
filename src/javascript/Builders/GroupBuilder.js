@@ -4,11 +4,11 @@ import SceneBuilder from "./SceneBuilder";
 
 class GroupBuilder {
 
-    static BuildGroup(options, scene) {
+    static BuildGroup(options, scene, textLoads, rootScene = scene, pendingHelpers = null) {
         const group = new THREE.Group();
+        group.uuid = options.uuid;
         options.children.forEach((childOptions) => {
-            // todo: changes for text here (see Viewer.SetScene)
-            var child = SceneBuilder.BuildChild(childOptions, scene);
+            var child = SceneBuilder.BuildChild(childOptions, group, textLoads, rootScene, pendingHelpers);
             if (child) {
                 group.add(child);
             }

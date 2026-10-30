@@ -8,6 +8,7 @@ module.exports = (env, argv) => {
   //todo: bundle.min.js for production mode
     return {
         mode: argv.mode === "production" ? "production" : "development",
+        devtool: argv.mode === "production" ? "source-map" : "eval",
         entry: ['./index.js'],
         output: {
             library:{

@@ -2,7 +2,7 @@ import * as THREE from "three";
 import Transforms from "../Utils/Transforms";
 
 class HelperBuilder {
-  static BuildHelper(options, scene) {
+  static BuildHelper(options, scene, rootScene = scene) {
     if (options.type == "ArrowHelper") {
       const dir = new THREE.Vector3(
         options.dir.x,
@@ -39,7 +39,8 @@ class HelperBuilder {
     }
 
     if (options.type == "BoxHelper") {
-      const obj = scene.getObjectByProperty("uuid", options.object3D.uuid);
+      const obj = scene.getObjectByProperty("uuid", options.object3D.uuid) ??
+        rootScene.getObjectByProperty("uuid", options.object3D.uuid);
       if (!obj) {
         throw `BoxHelper's object with uuid ${options.object3D.uuid} not found`;
       }
@@ -94,7 +95,8 @@ class HelperBuilder {
 
 
     if (options.type == "PointLightHelper") {
-      const obj = scene.getObjectByProperty("uuid", options.light.uuid);
+      const obj = scene.getObjectByProperty("uuid", options.light.uuid) ??
+        rootScene.getObjectByProperty("uuid", options.light.uuid);
       if (!obj) {
         throw `BoxHelper's object with uuid ${options.light.uuid} not found`;
       }

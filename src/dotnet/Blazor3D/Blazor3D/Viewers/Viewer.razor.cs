@@ -1,4 +1,3 @@
-﻿using System.Threading;
 using Microsoft.JSInterop;
 using Microsoft.AspNetCore.Components;
 using HomagGroup.Blazor3D.Settings;
@@ -24,6 +23,8 @@ namespace HomagGroup.Blazor3D.Viewers
     {
         private IJSObjectReference? bundleModule;
         private readonly SemaphoreSlim lifecycleGate = new(1, 1);
+        private readonly CancellationTokenSource lifetime = new();
+        private readonly string viewerInstanceId = Guid.NewGuid().ToString("N");
         private int disposeStarted;
         private bool eventsSubscribed;
         private bool IsDisposing => Volatile.Read(ref disposeStarted) != 0;
@@ -90,8 +91,8 @@ namespace HomagGroup.Blazor3D.Viewers
             if (!firstRender || IsDisposing) return;
             SubscribeEvents();
 
-            IJSObjectReference? importedModule = null;
-            try
+			IJSObjectReference? importedModule;
+			try
             {
                 importedModule = await JSRuntime.InvokeAsync<IJSObjectReference>(
                     "import", "./_content/DEM.Blazor3D/js/bundle.js");
@@ -113,13 +114,13 @@ namespace HomagGroup.Blazor3D.Viewers
 
                     var json = JsonConvert.SerializeObject(new
                     {
-                        Scene = Scene,
-                        ViewerSettings = ViewerSettings,
-                        Camera = Camera,
-                        OrbitControls = OrbitControls,
+						Scene,
+						ViewerSettings,
+						Camera,
+						OrbitControls,
                     }, SerializationHelper.GetSerializerSettings());
 
-                    await GetBundleModule().InvokeVoidAsync("loadViewer", json);
+                    await GetBundleModule().InvokeVoidAsync("loadViewer", lifetime.Token, viewerInstanceId, json);
                 }
             }
             catch (Exception) when (IsDisposing)
@@ -128,7 +129,7 @@ namespace HomagGroup.Blazor3D.Viewers
                 {
                     var failedModule = bundleModule;
                     bundleModule = null;
-                    await TryDisposeViewerAsync(failedModule, ViewerSettings?.ContainerId);
+                    await TryDisposeViewerAsync(failedModule, viewerInstanceId);
                     await TryDisposeModuleAsync(failedModule);
                 }
                 return;
@@ -139,7 +140,7 @@ namespace HomagGroup.Blazor3D.Viewers
                 {
                     var failedModule = bundleModule;
                     bundleModule = null;
-                    await TryDisposeViewerAsync(failedModule, ViewerSettings?.ContainerId);
+                    await TryDisposeViewerAsync(failedModule, viewerInstanceId);
                     await TryDisposeModuleAsync(failedModule);
                 }
                 throw;
@@ -160,32 +161,34 @@ namespace HomagGroup.Blazor3D.Viewers
         }
 
 
+        private object?[] InstanceArguments(object?[] args)
+        {
+            var result = new object?[args.Length + 1];
+            result[0] = viewerInstanceId;
+            Array.Copy(args, 0, result, 1, args.Length);
+            return result;
+        }
+
         private async Task InvokeBundleVoidAsync(string identifier, params object?[] args)
         {
-            await lifecycleGate.WaitAsync();
+            if (IsDisposing) throw new ObjectDisposedException(nameof(Viewer));
+            await lifecycleGate.WaitAsync(lifetime.Token);
             try
             {
-                if (IsDisposing || bundleModule is null) throw new ObjectDisposedException(nameof(Viewer));
-                await bundleModule.InvokeVoidAsync(identifier, args);
+                await GetBundleModule().InvokeVoidAsync(identifier, lifetime.Token, InstanceArguments(args));
             }
-            finally
-            {
-                lifecycleGate.Release();
-            }
+            finally { lifecycleGate.Release(); }
         }
 
         private async Task<T> InvokeBundleAsync<T>(string identifier, params object?[] args)
         {
-            await lifecycleGate.WaitAsync();
+            if (IsDisposing) throw new ObjectDisposedException(nameof(Viewer));
+            await lifecycleGate.WaitAsync(lifetime.Token);
             try
             {
-                if (IsDisposing || bundleModule is null) throw new ObjectDisposedException(nameof(Viewer));
-                return await bundleModule.InvokeAsync<T>(identifier, args);
+                return await GetBundleModule().InvokeAsync<T>(identifier, lifetime.Token, InstanceArguments(args));
             }
-            finally
-            {
-                lifecycleGate.Release();
-            }
+            finally { lifecycleGate.Release(); }
         }
 
         private void SubscribeEvents()
@@ -215,6 +218,12 @@ namespace HomagGroup.Blazor3D.Viewers
             var json = JsonConvert.SerializeObject(Scene, SerializationHelper.GetSerializerSettings());
             await InvokeBundleVoidAsync("updateScene", json);
         }
+
+        /// <summary>Pauses rendering while preserving the viewer and its scene.</summary>
+        public Task PauseRendering() => InvokeBundleVoidAsync("pauseViewer");
+
+        /// <summary>Resumes rendering and renders the current scene.</summary>
+        public Task ResumeRendering() => InvokeBundleVoidAsync("resumeViewer");
 
         /// <summary>
         /// <para>Sets the camera position to specified <see cref="Vector3"/> value.</para>
@@ -404,7 +413,7 @@ namespace HomagGroup.Blazor3D.Viewers
 
         private void OnObjectSelectedStatic(Object3DStaticArgs e)
         {
-            if (!IsDisposing && ViewerSettings.ContainerId == e.ContainerId)
+            if (!IsDisposing && viewerInstanceId == e.ContainerId)
             {
                 ObjectSelected?.Invoke(new Object3DArgs() { UUID = e.UUID });
             }
@@ -412,7 +421,7 @@ namespace HomagGroup.Blazor3D.Viewers
 
         private void OnObjectLoadedStatic(Object3DStaticArgs e)
         {
-            if (!IsDisposing && ViewerSettings.ContainerId == e.ContainerId)
+            if (!IsDisposing && viewerInstanceId == e.ContainerId)
             {
                 ObjectLoadedPrivate?.Invoke(new Object3DArgs() { UUID = e.UUID });
             }
@@ -529,9 +538,10 @@ namespace HomagGroup.Blazor3D.Viewers
         {
             try
             {
-                await module.InvokeVoidAsync("disposeViewer", containerId);
+                using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+                await module.InvokeVoidAsync("disposeViewer", timeout.Token, containerId);
             }
-            catch (Exception ex) when (ex is JSDisconnectedException || ex is JSException || ex is ObjectDisposedException || ex is InvalidOperationException)
+            catch (Exception ex) when (ex is JSDisconnectedException || ex is JSException || ex is ObjectDisposedException || ex is InvalidOperationException || ex is OperationCanceledException)
             {
             }
         }
@@ -542,7 +552,7 @@ namespace HomagGroup.Blazor3D.Viewers
             {
                 await module.DisposeAsync();
             }
-            catch (Exception ex) when (ex is JSDisconnectedException || ex is JSException || ex is ObjectDisposedException || ex is InvalidOperationException)
+            catch (Exception ex) when (ex is JSDisconnectedException || ex is JSException || ex is ObjectDisposedException || ex is InvalidOperationException || ex is OperationCanceledException)
             {
             }
         }
@@ -567,7 +577,11 @@ namespace HomagGroup.Blazor3D.Viewers
         public async ValueTask DisposeAsync()
         {
             if (Interlocked.Exchange(ref disposeStarted, 1) != 0) return;
+            lifetime.Cancel();
             UnsubscribeEvents();
+            JsModuleLoaded = null!;
+            ObjectLoaded = null!;
+            ObjectSelected = null!;
 
             await lifecycleGate.WaitAsync();
             try
@@ -576,13 +590,14 @@ namespace HomagGroup.Blazor3D.Viewers
                 bundleModule = null;
                 if (module is not null)
                 {
-                    await TryDisposeViewerAsync(module, ViewerSettings?.ContainerId);
+                    await TryDisposeViewerAsync(module, viewerInstanceId);
                     await TryDisposeModuleAsync(module);
                 }
             }
             finally
             {
                 lifecycleGate.Release();
+                lifetime.Dispose();
             }
         }
     }
