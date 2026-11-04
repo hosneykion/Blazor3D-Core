@@ -27,13 +27,16 @@ class Viewer3D {
     this.disposed = false;
     this.paused = false;
     this.instanceId = instanceId ?? options.viewerSettings.containerId;
-    this.textLoads = new TextLoadScope();
     this.animationFrameId = null;
     this.sceneGeneration = 0;
     this.onDisposed = onDisposed;
     this.options = options;
     this.container = container;
     this.clock = new THREE.Clock();
+    this.animateFrame = this.animateFrame.bind(this);
+    this.requestRender = this.requestRender.bind(this);
+    this.onControlsChange = () => this.requestRender();
+    this.textLoads = new TextLoadScope(undefined, this.requestRender);
 
     this.scene = new THREE.Scene();
     this.setScene();
@@ -54,12 +57,15 @@ class Viewer3D {
 
     this.renderer.domElement.onclick = (event) => {
       if (this.disposed) return;
+      if (this.viewHelper?.handleClick(event)) {
+        this.requestRender();
+      }
       if (this.options.viewerSettings.canSelect == true) {
         this.selectObject(event);
       }
       if (
         this.options.camera.animateRotationSettings
-          .stopAnimationOnOrbitControlMove == true
+          ?.stopAnimationOnOrbitControlMove === true
       ) {
         this.options.camera.animateRotationSettings.animateRotation = false;
       }
@@ -70,9 +76,15 @@ class Viewer3D {
     this.setCamera();
     this.setOrbitControls();
     this.onResize();
+    this.requestRender();
+  }
 
-    this.animateFrame = this.animateFrame.bind(this);
-    this.animateFrame();
+  requestRender() {
+    if (this.disposed || this.paused || this.animationFrameId !== null) {
+      return;
+    }
+
+    this.animationFrameId = requestAnimationFrame(this.animateFrame);
   }
 
   animateFrame() {
@@ -87,8 +99,13 @@ class Viewer3D {
     }
 
     try {
-      this.controls?.update();
-      this.render();
+      const controlsChanged = this.controls?.update() ?? false;
+      const delta = this.clock.getDelta();
+      if (this.viewHelper?.animating) this.viewHelper.update(delta);
+      this.render(delta);
+      if (this.hasActiveAnimations() || controlsChanged) {
+        this.requestRender();
+      }
     } catch (error) {
       console.error(
         "Blazor3D render loop failed; disposing the viewer.",
@@ -97,10 +114,16 @@ class Viewer3D {
       this.dispose();
       return;
     }
+  }
 
-    if (!this.disposed && !this.paused) {
-      this.animationFrameId = requestAnimationFrame(this.animateFrame);
-    }
+  hasActiveAnimations() {
+    return (
+      this.viewHelper?.animating === true ||
+      this.options.camera.animateRotationSettings?.animateRotation === true ||
+      this.options.scene.children.some(
+        (child) => child.animateObject3DSettings?.animateObject === true,
+      )
+    );
   }
 
   pause() {
@@ -118,13 +141,14 @@ class Viewer3D {
     this.paused = false;
     this.clock?.start();
     this.onResize();
-    this.animateFrame();
+    this.requestRender();
   }
 
-  render() {
+  render(delta) {
     if (this.disposed) return;
+
     this.rotateCamera();
-    this.animateObjects();
+    this.animateObjects(delta);
 
     if (this.options.viewerSettings.showViewHelper && this.viewHelper) {
       this.renderer.clear();
@@ -165,6 +189,7 @@ class Viewer3D {
 
     this.camera.updateProjectionMatrix();
     this.renderer.setSize(width, height, false);
+    this.requestRender();
   }
 
   setScene() {
@@ -202,6 +227,7 @@ class Viewer3D {
     this.clearScene();
     this.options.scene = sceneOptions;
     this.setScene();
+    this.requestRender();
   }
 
   disposeViewHelper() {
@@ -235,6 +261,7 @@ class Viewer3D {
     this.options.camera = newCamera;
     this.setCamera();
     this.setOrbitControls();
+    this.requestRender();
   }
 
   rotateCamera() {
@@ -270,7 +297,7 @@ class Viewer3D {
     this.camera.updateMatrixWorld();
   }
 
-  animateObjects() {
+  animateObjects(delta) {
     const objectsToAnimate = this.options.scene.children.filter(
       (x) => x.animateObject3DSettings?.animateObject === true,
     );
@@ -310,10 +337,7 @@ class Viewer3D {
       const target = new THREE.Vector3(x, y, z).sub(object3d.position);
       target.normalize();
 
-      object3d.translateOnAxis(
-        target,
-        this.clock.getDelta() * animationSettings.speed,
-      );
+      object3d.translateOnAxis(target, delta * animationSettings.speed);
 
       const distance = new THREE.Vector3(x, y, z)
         .sub(object3d.position)
@@ -330,8 +354,15 @@ class Viewer3D {
   }
 
   setOrbitControls() {
-    this.controls?.dispose();
+    if (this.controls) {
+      this.controls.removeEventListener("change", this.onControlsChange);
+      this.controls.dispose();
+    }
     this.controls = new OrbitControls(this.camera, this.renderer.domElement);
+    this.controls.addEventListener("change", this.onControlsChange);
+    if (this.viewHelper) {
+      this.viewHelper.controls = { center: this.controls.target };
+    }
     this.controls.screenSpacePanning = true;
     this.controls.minDistance = this.options.orbitControls.minDistance;
     this.controls.maxDistance = this.options.orbitControls.maxDistance;
@@ -346,6 +377,7 @@ class Viewer3D {
   updateOrbitControls(newOrbitControls) {
     this.options.orbitControls = newOrbitControls;
     this.setOrbitControls();
+    this.requestRender();
   }
 
   import3DModel(settings) {
@@ -358,7 +390,13 @@ class Viewer3D {
       this.scene === scene &&
       this.sceneGeneration === generation;
 
-    return Loaders.import3DModel(scene, settings, this.instanceId, isActive);
+    return Loaders.import3DModel(
+      scene,
+      settings,
+      this.instanceId,
+      isActive,
+      this.requestRender,
+    );
   }
 
   importSprite(settings) {
@@ -371,7 +409,13 @@ class Viewer3D {
       this.scene === scene &&
       this.sceneGeneration === generation;
 
-    return Loaders.importSprite(scene, settings, this.instanceId, isActive);
+    return Loaders.importSprite(
+      scene,
+      settings,
+      this.instanceId,
+      isActive,
+      this.requestRender,
+    );
   }
 
   getSceneItemByGuid(guid) {
@@ -417,6 +461,7 @@ class Viewer3D {
     if (intersects.length == 0) {
       if (this.INTERSECTED) {
         this.INTERSECTED.material.color.setHex(this.INTERSECTED.currentHex);
+        this.requestRender();
       }
 
       this.INTERSECTED = null;
@@ -469,6 +514,7 @@ class Viewer3D {
       this.camera.lookAt(x, y, z);
       this.controls.target.set(x, y, z);
     }
+    this.requestRender();
   }
 
   getFirstNonHelper(intersects) {
@@ -508,6 +554,7 @@ class Viewer3D {
     }
 
     this.renderer?.renderLists?.dispose();
+    this.requestRender();
     return true;
   }
 
@@ -553,6 +600,7 @@ class Viewer3D {
     this.scene.clear();
     if (this.options?.scene) this.options.scene.children = [];
     this.renderer?.renderLists?.dispose();
+    this.requestRender();
   }
 
   dispose() {
@@ -628,6 +676,7 @@ class Viewer3D {
       this.INTERSECTED.material.color.setHex(
         new THREE.Color(this.options.viewerSettings.selectedColor).getHex(),
       );
+      this.requestRender();
     }
   }
 }

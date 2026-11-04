@@ -1,8 +1,9 @@
 import { FontLoader } from "three/examples/jsm/loaders/FontLoader.js";
 
 export default class TextLoadScope {
-  constructor(loader = new FontLoader()) {
+  constructor(loader = new FontLoader(), onLoaded = null) {
     this.loader = loader;
+    this.onLoaded = onLoaded;
     this.pending = new Map();
     this.fonts = new Map();
     this.nextId = 0;
@@ -25,7 +26,10 @@ export default class TextLoadScope {
     promise.then(font => {
       const build = this.pending.get(id);
       this.pending.delete(id);
-      if (build && !this.disposed) build(font);
+      if (build && !this.disposed) {
+        build(font);
+        this.onLoaded?.();
+      }
     }).catch(error => {
       const wasActive = this.pending.delete(id);
       if (this.fonts.get(url) === promise) this.fonts.delete(url);
@@ -39,5 +43,6 @@ export default class TextLoadScope {
     this.clear();
     this.fonts.clear();
     this.loader = null;
+    this.onLoaded = null;
   }
 }

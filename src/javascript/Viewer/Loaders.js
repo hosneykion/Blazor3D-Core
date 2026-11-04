@@ -9,7 +9,7 @@ import MaterialBuilder from "../Builders/MaterialBuilder";
 import disposeOwnedResources from "../Utils/DisposeOwnedResources";
 
 class Loaders {
-  static loadGltf(scene, url, guid, containerId, isActive) {
+  static loadGltf(scene, url, guid, containerId, isActive, onLoaded) {
     const loader = new GLTFLoader();
     loader.load(url, (object) => {
       if (!isActive()) {
@@ -18,11 +18,12 @@ class Loaders {
       }
       object.scene.uuid = guid;
       scene.add(object.scene);
+      onLoaded?.();
       Loaders.callDotNet(containerId, guid, isActive);
     });
   }
 
-  static loadFbx(scene, url, guid, containerId, isActive) {
+  static loadFbx(scene, url, guid, containerId, isActive, onLoaded) {
     const loader = new FBXLoader();
     loader.load(url, (object) => {
       if (!isActive()) {
@@ -31,11 +32,12 @@ class Loaders {
       }
       scene.add(object);
       object.uuid = guid;
+      onLoaded?.();
       Loaders.callDotNet(containerId, guid, isActive);
     });
   }
 
-  static loadCollada(scene, url, guid, containerId, isActive) {
+  static loadCollada(scene, url, guid, containerId, isActive, onLoaded) {
     let object;
     const manager = new THREE.LoadingManager(() => {
       if (!object) return;
@@ -45,6 +47,7 @@ class Loaders {
       }
       scene.add(object);
       object.uuid = guid;
+      onLoaded?.();
       Loaders.callDotNet(containerId, guid, isActive);
     });
     const loader = new ColladaLoader(manager);
@@ -53,7 +56,15 @@ class Loaders {
     });
   }
 
-  static loadOBJ(scene, objUrl, textureUrl, guid, containerId, isActive) {
+  static loadOBJ(
+    scene,
+    objUrl,
+    textureUrl,
+    guid,
+    containerId,
+    isActive,
+    onLoaded,
+  ) {
     let object = null;
     let texture = null;
     let textureAssigned = false;
@@ -109,6 +120,7 @@ class Loaders {
       scene.add(object);
       object.uuid = guid;
 
+      onLoaded?.();
       Loaders.callDotNet(containerId, guid, isActive);
     });
 
@@ -133,7 +145,15 @@ class Loaders {
     return object;
   }
 
-  static loadStl(scene, url, guid, containerId, materialSettings, isActive) {
+  static loadStl(
+    scene,
+    url,
+    guid,
+    containerId,
+    materialSettings,
+    isActive,
+    onLoaded,
+  ) {
     const loader = new STLLoader();
     loader.load(url, function (geometry) {
       if (!isActive()) {
@@ -157,11 +177,18 @@ class Loaders {
       // mesh.receiveShadow = true;
 
       scene.add(mesh);
+      onLoaded?.();
       Loaders.callDotNet(containerId, guid, isActive);
     });
   }
 
-  static import3DModel(scene, settings, containerId, isActive = () => true) {
+  static import3DModel(
+    scene,
+    settings,
+    containerId,
+    isActive = () => true,
+    onLoaded,
+  ) {
     const format = settings.format;
     let objUrl = settings.fileURL;
     let textureUrl = settings.textureURL;
@@ -176,16 +203,38 @@ class Loaders {
         guid,
         containerId,
         isActive,
+        onLoaded,
       );
     }
     if (format == "Collada") {
-      return Loaders.loadCollada(scene, objUrl, guid, containerId, isActive);
+      return Loaders.loadCollada(
+        scene,
+        objUrl,
+        guid,
+        containerId,
+        isActive,
+        onLoaded,
+      );
     }
     if (format == "Fbx") {
-      return Loaders.loadFbx(scene, objUrl, guid, containerId, isActive);
+      return Loaders.loadFbx(
+        scene,
+        objUrl,
+        guid,
+        containerId,
+        isActive,
+        onLoaded,
+      );
     }
     if (format == "Gltf") {
-      return Loaders.loadGltf(scene, objUrl, guid, containerId, isActive);
+      return Loaders.loadGltf(
+        scene,
+        objUrl,
+        guid,
+        containerId,
+        isActive,
+        onLoaded,
+      );
     }
 
     if (format == "Stl") {
@@ -196,13 +245,20 @@ class Loaders {
         containerId,
         material,
         isActive,
+        onLoaded,
       );
     }
 
     return null;
   }
 
-  static importSprite(scene, settings, containerId, isActive = () => true) {
+  static importSprite(
+    scene,
+    settings,
+    containerId,
+    isActive = () => true,
+    onLoaded,
+  ) {
     if (!isActive()) return;
 
     let url = settings.fileURL;
@@ -217,6 +273,7 @@ class Loaders {
     sprite.uuid = guid;
     sprite.name = settings.name;
     scene.add(sprite);
+    onLoaded?.();
     Loaders.callDotNet(containerId, guid, isActive);
   }
 
