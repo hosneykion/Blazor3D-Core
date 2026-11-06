@@ -2,7 +2,6 @@ import TextLoadScope from "../Utils/TextLoadScope";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls";
 import Loaders from "./Loaders";
-import Exporters from "./Exporters"; //todo
 import TextBuilder from "../Builders/TextBuilder";
 import SceneBuilder from "../Builders/SceneBuilder";
 import CameraBuilder from "../Builders/CameraBuilder";
@@ -13,6 +12,8 @@ import disposeOwnedResources, {
   disposeTextures,
 } from "../Utils/DisposeOwnedResources";
 
+console.warn("Running Blazor3D Viewer3D.js version 187");
+
 class Viewer3D {
   thetaX = 0;
   thetaY = 0;
@@ -21,7 +22,7 @@ class Viewer3D {
   raycaster = new THREE.Raycaster();
 
   INTERSECTED = null;
-  clock = null;
+  timer = null;
 
   constructor(options, container, onDisposed = null, instanceId = null) {
     this.disposed = false;
@@ -32,7 +33,8 @@ class Viewer3D {
     this.onDisposed = onDisposed;
     this.options = options;
     this.container = container;
-    this.clock = new THREE.Clock();
+    this.timer = new THREE.Timer();
+    this.timer.connect(document);
     this.animateFrame = this.animateFrame.bind(this);
     this.requestRender = this.requestRender.bind(this);
     this.onControlsChange = () => this.requestRender();
@@ -47,6 +49,8 @@ class Viewer3D {
         this.options.viewerSettings.webGLRendererSettings.premultipliedAlpha,
       alpha: this.options.viewerSettings.webGLRendererSettings.alpha,
     });
+
+    //this.renderer.useLegacyLights = true;
 
     if (this.options.viewerSettings.showViewHelper) {
       this.renderer.autoClear = false;
@@ -87,7 +91,7 @@ class Viewer3D {
     this.animationFrameId = requestAnimationFrame(this.animateFrame);
   }
 
-  animateFrame() {
+  animateFrame(timestamp) {
     this.animationFrameId = null;
     if (this.disposed || this.paused) return;
     if (
@@ -100,7 +104,7 @@ class Viewer3D {
 
     try {
       const controlsChanged = this.controls?.update() ?? false;
-      const delta = this.clock.getDelta();
+      const delta = this.timer.update(timestamp).getDelta();
       if (this.viewHelper?.animating) this.viewHelper.update(delta);
       this.render(delta);
       if (this.hasActiveAnimations() || controlsChanged) {
@@ -133,20 +137,19 @@ class Viewer3D {
       cancelAnimationFrame(this.animationFrameId);
       this.animationFrameId = null;
     }
-    this.clock?.stop();
   }
 
   resume() {
     if (this.disposed || !this.paused) return;
     this.paused = false;
-    this.clock?.start();
+    this.timer?.reset();
     this.onResize();
     this.requestRender();
   }
 
   render(delta) {
     if (this.disposed) return;
-
+    console.count(`[Blazor3D ${this.instanceId}] Render`);
     this.rotateCamera();
     this.animateObjects(delta);
 
@@ -625,6 +628,7 @@ class Viewer3D {
 
     try {
       cleanup("orbit controls", () => this.controls?.dispose());
+      cleanup("timer", () => this.timer?.dispose());
       cleanup("view helper resources", () => this.disposeViewHelper());
       cleanup("scene resources", () => this.clearScene());
 
@@ -659,7 +663,7 @@ class Viewer3D {
       this.viewHelper = null;
       this.renderer = null;
       this.container = null;
-      this.clock = null;
+      this.timer = null;
       this.mouse = null;
       this.raycaster = null;
       cleanup("disposal notification", () => notifyDisposed?.(this));
