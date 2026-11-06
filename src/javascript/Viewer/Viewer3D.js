@@ -12,8 +12,6 @@ import disposeOwnedResources, {
   disposeTextures,
 } from "../Utils/DisposeOwnedResources";
 
-console.warn("Running Blazor3D Viewer3D.js version 187");
-
 class Viewer3D {
   thetaX = 0;
   thetaY = 0;
@@ -149,7 +147,7 @@ class Viewer3D {
 
   render(delta) {
     if (this.disposed) return;
-    console.count(`[Blazor3D ${this.instanceId}] Render`);
+
     this.rotateCamera();
     this.animateObjects(delta);
 
